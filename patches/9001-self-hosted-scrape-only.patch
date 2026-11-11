@@ -1,0 +1,268 @@
+Self-hosted Firecrawl entrypoint exposing firecrawl_scrape only
+
+Require FIRECRAWL_API_URL and drop the hosted service layer (OAuth, search
+profile, keyless). Register only firecrawl_scrape (toolFilter) and narrow its
+cloud-oriented definition to what a self-hosted instance supports (wrapTool).
+
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,15 +1,10 @@
+ #!/usr/bin/env node
++import { z } from 'zod';
+ import {
+   createFirecrawlMcpServer,
+-  type FirecrawlMcpServerOptions,
+   type FirecrawlMcpServerStartArgs,
++  type ToolDefinition,
+ } from './server.js';
+-import {
+-  createServiceHooks,
+-  makePrimaryProfile,
+-  makeSearchProfile,
+-  resolveCredentialFromEnv,
+-} from './service/index.js';
+ 
+ try {
+   process.loadEnvFile();
+@@ -17,62 +12,95 @@
+   if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+ }
+ 
+-const FEEDBACK_DISABLED_VALUES = new Set(['1', 'true', 'yes', 'on']);
+-
+-function feedbackEnvEnabled(...keys: string[]): boolean {
+-  return keys.some((key) =>
+-    FEEDBACK_DISABLED_VALUES.has((process.env[key] || '').trim().toLowerCase())
+-  );
++const ALLOWED_TOOLS = new Set(['firecrawl_scrape']);
++const INSTRUCTIONS =
++  'firecrawl_scrape retrieves one supplied page through a self-hosted Firecrawl instance and returns its content (markdown by default). It does not search the web; find URLs with a separate search tool first.';
++
++// Upstream's definition describes Firecrawl cloud. Keep only the fields a
++// self-hosted instance supports; execute() receives only these arguments.
++const SCRAPE_DESCRIPTION = `
++Scrape one web page through a self-hosted Firecrawl instance and return its content. Use it when you have a URL (from the user or from a separate web search tool) and need the page's content or specific fields from it. This tool cannot search the web or discover URLs.
++
++Returns markdown by default. Other formats: html, rawHtml, links, images, summary, json (structured data: pass jsonOptions.prompt and/or jsonOptions.schema) and query (an answer to a question about the page: pass queryOptions.prompt). summary, json and query need an LLM provider configured on the Firecrawl instance. waitFor and timeout are in milliseconds. Each call fetches the page live; a PDF or document at the URL is parsed too.
++`;
++const SCRAPE_INPUT = {
++  url: true,
++  formats: true,
++  jsonOptions: true,
++  queryOptions: true,
++  onlyMainContent: true,
++  includeTags: true,
++  excludeTags: true,
++  waitFor: true,
++  timeout: true,
++  parsers: true,
++  pdfOptions: true,
++  skipTlsVerification: true,
++  removeBase64Images: true,
++} as const;
++const SCRAPE_OUTPUT = {
++  markdown: true,
++  html: true,
++  rawHtml: true,
++  summary: true,
++  links: true,
++  images: true,
++  answer: true,
++  json: true,
++  metadata: true,
++  warning: true,
++  success: true,
++  error: true,
++} as const;
++
++function adaptTool(tool: ToolDefinition): ToolDefinition {
++  if (tool.name !== 'firecrawl_scrape') return tool;
++  return {
++    ...tool,
++    description: SCRAPE_DESCRIPTION,
++    parameters: (tool.parameters as z.ZodObject<Record<keyof typeof SCRAPE_INPUT, z.ZodType>>)
++      .pick(SCRAPE_INPUT)
++      .extend({
++        formats: z
++          .array(z.enum(['markdown', 'html', 'rawHtml', 'links', 'images', 'summary', 'json', 'query']))
++          .optional(),
++      })
++      .required({ url: true }),
++    outputSchema: (tool.outputSchema as z.ZodObject<Record<keyof typeof SCRAPE_OUTPUT, z.ZodType>>).pick(
++      SCRAPE_OUTPUT
++    ),
++    annotations: { ...tool.annotations, readOnlyHint: true },
++  };
+ }
+ 
+-const hosted = process.env.CLOUD_SERVICE === 'true';
+-const httpStreaming =
+-  process.env.HTTP_STREAMABLE_SERVER === 'true' ||
+-  process.env.SSE_LOCAL === 'true';
+-const apiKey = resolveCredentialFromEnv();
+-const apiUrl = process.env.FIRECRAWL_API_URL;
+-const primaryProfile = makePrimaryProfile();
+-
+-const searchFeedbackDisabled = feedbackEnvEnabled(
+-  'FIRECRAWL_NO_SEARCH_FEEDBACK',
+-  'FIRECRAWL_DISABLE_SEARCH_FEEDBACK'
+-);
+-const endpointFeedbackDisabled = feedbackEnvEnabled(
+-  'FIRECRAWL_NO_ENDPOINT_FEEDBACK',
+-  'FIRECRAWL_DISABLE_ENDPOINT_FEEDBACK'
+-);
+-
+-if (searchFeedbackDisabled) {
++const apiUrl = process.env.FIRECRAWL_API_URL?.trim();
++if (!apiUrl) {
+   console.error(
+-    '[firecrawl-mcp] Search feedback tool disabled by FIRECRAWL_NO_SEARCH_FEEDBACK; firecrawl_search_feedback will not be registered.'
+-  );
+-}
+-if (endpointFeedbackDisabled) {
+-  console.error(
+-    '[firecrawl-mcp] Endpoint feedback tool disabled by FIRECRAWL_NO_ENDPOINT_FEEDBACK; firecrawl_feedback will not be registered.'
++    '[firecrawl-mcp] FIRECRAWL_API_URL is required: set it to the self-hosted Firecrawl API URL.'
+   );
++  process.exit(1);
+ }
++const apiKey = process.env.FIRECRAWL_API_KEY?.trim() || undefined;
++const transport =
++  process.env.HTTP_STREAMABLE_SERVER === 'true' ||
++  process.env.SSE_LOCAL === 'true'
++    ? 'httpStream'
++    : 'stdio';
+ 
+-const transport = hosted || httpStreaming ? 'httpStream' : 'stdio';
+-const options: FirecrawlMcpServerOptions = {
++const { start } = createFirecrawlMcpServer({
+   apiUrl,
+   apiKey,
+   transport,
+   logging: transport === 'httpStream',
+-  safeMode: hosted,
+-  fileAccess: hosted ? 'upload' : 'local',
+-  requireCredential: hosted,
+-  searchFeedback: !searchFeedbackDisabled,
+-  endpointFeedback: !endpointFeedbackDisabled,
++  fileAccess: 'local',
++  requireCredential: false,
++  searchFeedback: false,
++  endpointFeedback: false,
+   integration: process.env.FIRECRAWL_INTEGRATION,
+-};
+-const serviceSettings = { hosted, transport, apiKey, apiUrl } as const;
+-
+-const primaryHooks = createServiceHooks(primaryProfile, serviceSettings);
+-const { start } = createFirecrawlMcpServer({
+-  ...options,
+   unstable_hooks: {
+-    ...primaryHooks,
++    toolFilter: (name) => ALLOWED_TOOLS.has(name),
++    wrapTool: adaptTool,
++    instructions: INSTRUCTIONS,
+     configureHttp: (app) => {
+       app.get('/ready', (context) => context.json({ ok: true }, 200));
+     },
+@@ -80,20 +108,18 @@
+ });
+ 
+ const PORT = Number(process.env.PORT || 3000);
+-const HOST = hosted ? '0.0.0.0' : process.env.HOST || 'localhost';
++const HOST = process.env.HOST || 'localhost';
+ const WILDCARD_ADDRESSES = new Set(['0.0.0.0', '::']);
+-const allowedHosts = hosted
+-  ? undefined
+-  : [
+-      'localhost',
+-      '127.0.0.1',
+-      '[::1]',
+-      ...(WILDCARD_ADDRESSES.has(HOST) ? [] : [HOST]),
+-      ...(process.env.FIRECRAWL_MCP_ALLOWED_HOSTS || '')
+-        .split(',')
+-        .map((entry) => entry.trim())
+-        .filter(Boolean),
+-    ];
++const allowedHosts = [
++  'localhost',
++  '127.0.0.1',
++  '[::1]',
++  ...(WILDCARD_ADDRESSES.has(HOST) ? [] : [HOST]),
++  ...(process.env.FIRECRAWL_MCP_ALLOWED_HOSTS || '')
++    .split(',')
++    .map((entry) => entry.trim())
++    .filter(Boolean),
++];
+ 
+ const args: FirecrawlMcpServerStartArgs =
+   transport === 'httpStream'
+@@ -102,69 +128,15 @@
+         httpStream: {
+           port: PORT,
+           host: HOST,
+-          endpoint: primaryProfile.endpoint,
+           stateless: true,
+           allowedHosts,
+         },
+       }
+     : { transportType: 'stdio' };
+ 
+-if (
+-  transport === 'stdio' &&
+-  !process.env.FIRECRAWL_API_KEY &&
+-  !process.env.FIRECRAWL_API_URL
+-) {
+-  // No credential and no self-hosted URL: run in keyless mode. scrape and
+-  // search work for free (rate-limited per IP) against the Firecrawl cloud;
+-  // every other tool needs an API key and will return Unauthorized.
+-  console.error(
+-    'No FIRECRAWL_API_KEY or FIRECRAWL_API_URL set — running in keyless mode. ' +
+-      'firecrawl_scrape and firecrawl_search are free (rate-limited per IP) against the Firecrawl cloud; ' +
+-      'other tools require an API key (get one free at https://firecrawl.dev).'
+-  );
+-}
+-
+ try {
+   await start(args);
+ } catch (error) {
+   console.error('[firecrawl-mcp] Failed to start:', error);
+   process.exit(1);
+ }
+-
+-// Bring up the search surface as a second in-process instance on its own port
+-// (FIRECRAWL_MCP_SEARCH_PORT); a reverse proxy in front of the process routes
+-// its public path there. The full surface above is untouched. Only registered
+-// in the hosted profile and when not disabled.
+-const searchProfileEnabled =
+-  hosted &&
+-  primaryProfile.id === 'full' &&
+-  process.env.FIRECRAWL_MCP_SEARCH_ENABLED !== 'false';
+-
+-if (searchProfileEnabled) {
+-  const searchProfile = makeSearchProfile();
+-  const searchServer = createFirecrawlMcpServer({
+-    ...options,
+-    unstable_hooks: createServiceHooks(searchProfile, serviceSettings),
+-  });
+-
+-  // Isolate the search instance from the already-serving full instance: if it
+-  // fails to bind (port in use, etc.), log and carry on rather than let a
+-  // top-level rejection exit the process and take the healthy full surface down.
+-  try {
+-    await searchServer.start({
+-      transportType: 'httpStream',
+-      httpStream: {
+-        port: searchProfile.port,
+-        host: HOST,
+-        endpoint: searchProfile.endpoint,
+-        stateless: true,
+-      },
+-    });
+-  } catch (error) {
+-    console.error(
+-      `[search-profile] failed to start on port ${searchProfile.port}; ` +
+-        'the full surface is unaffected',
+-      error
+-    );
+-  }
+-}
